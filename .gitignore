@@ -1,17 +1,24 @@
-# Ignore Python cache and compiled files
+# Python junk
 __pycache__/
 *.py[cod]
 
-# Ignore virtual environments
-venv/
-env/
-
-# Ignore Windows hidden files
-Thumbs.db
-.DS_Store
-
-# Ignore builds and PyInstaller output
-*.spec
-dist/
+# PyInstaller
 build/
+dist/
+*.spec
 *.exe
+
+# Audio/Video
+*.mp3
+*.mp4
+*.wav
+*.mov
+
+# VS Code / Workspace stuff
+.vscode/
+*.code-workspace
+
+# OS garbage
+.DS_Store
+Thumbs.db
+
