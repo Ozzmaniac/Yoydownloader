@@ -17,11 +17,16 @@ def check_for_update():
         response = requests.get(VERSION_URL, timeout=5)
         response.raise_for_status()
         latest = response.text.strip()
+        print(f"[Updater] Current: {VERSION} | Latest from version.txt: {latest}")
         if latest != VERSION:
+            print("[Updater] Update is available!")
             return latest
+        else:
+            print("[Updater] No update needed.")
     except Exception as e:
         print(f"[Updater] Failed to check version: {e}")
     return None
+
 
 def run_updater():
     # Create a temporary copy of the running EXE and run it with update flag

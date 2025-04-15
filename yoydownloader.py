@@ -1,3 +1,4 @@
+
 import os
 import random
 import pandas as pd
@@ -26,8 +27,7 @@ CONFIG_PATH = os.path.join(os.getenv("APPDATA"), APP_NAME, CONFIG_FILENAME)
 # Ensure the folder exists
 os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
 
-#VER NUMBER
-VERSION = "2.0.8"
+
 
 # Handle update mode
 if "--update" in sys.argv and len(sys.argv) > 2:
