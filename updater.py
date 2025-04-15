@@ -9,7 +9,7 @@ from tkinter import messagebox
 
 # Config
 GITHUB_API = "https://api.github.com/repos/Ozzmaniac/Yoydownloader/releases/latest"
-LOCAL_VERSION = "2.0.6"  # Update this when building a new version
+VERSION = "2.0.6"  # Update this when building a new version
 
 def get_latest_release_info():
     try:

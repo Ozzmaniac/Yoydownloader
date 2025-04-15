@@ -18,7 +18,29 @@ from playsound import playsound as play_audio
 import threading
 from updater import get_latest_release_info, run_updater
 
+#VER NUMBER
+VERSION = "2.0.6"
+
+
+
 #Auto Updater
+def check_for_updates_at_launch():
+    try:
+        latest_version, zip_url = get_latest_release_info()
+        if latest_version and latest_version != VERSION:
+            result = messagebox.askyesno(
+                "Update Available",
+                f"A new version ({latest_version}) is available.\nDo you want to update now?"
+            )
+            if result:
+                run_updater(zip_url)
+    except Exception as e:
+        print(f"[Auto-Updater] Failed to check for updates: {e}")
+
+
+
+
+
 latest_version, zip_url = get_latest_release_info()
 if latest_version and latest_version != "2.0.6":  # Match LOCAL_VERSION
     result = messagebox.askyesno(
@@ -98,7 +120,7 @@ def load_config():
         
 #Base window creation
 root = tk.Tk()
-VERSION = "2.0.6"
+check_for_updates_at_launch()
 root.title(f"YoyDownloader v{VERSION}")
 root.configure(bg="#2e2e2e")  
 
