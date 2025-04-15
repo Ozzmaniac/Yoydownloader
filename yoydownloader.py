@@ -17,7 +17,7 @@ from tkvideo import tkvideo as VideoPlayer
 from playsound import playsound as play_audio
 import threading
 
-#test
+
 #Resource Path 
 def resource_path(relative_path):
     if hasattr(sys, '_MEIPASS'):
