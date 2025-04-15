@@ -93,7 +93,7 @@ root.title(f"YoyDownloader v{VERSION}")
 root.configure(bg="#2e2e2e")  
 
 # Set program icon
-icon_path = resource_path("gura.ico")
+icon_path = resource_path("assets/gura.ico")
 try:
     if platform.system() == "Windows":
         root.iconbitmap(default=icon_path)
@@ -603,7 +603,7 @@ def _generate_thumbnail_core():
         opponent_name_pos = positions["opponent_name_P1"]
 
     # Text rendering
-    font_path = resource_path("HyliaSerif.otf")
+    font_path = resource_path("assets/HyliaSerif.otf")
     if not os.path.exists(font_path):
         log_message("Error: Missing font file HyliaSerif.otf\n")
         return None
@@ -713,7 +713,7 @@ def save_thumbnail_as_psd():
             text_img = Image.new("RGBA", (1280, 720), (0, 0, 0, 0))
             draw = ImageDraw.Draw(text_img)
             
-            font_path = resource_path("HyliaSerif.otf")
+            font_path = resource_path("assets/HyliaSerif.otf")
             if not os.path.exists(font_path):
                 raise FileNotFoundError("Font file missing")
                 
@@ -954,7 +954,7 @@ def on_gura_click(event):
     show_epic_tab()
 
 try:
-    image_path = resource_path("gawr_gura.png")
+    image_path = resource_path("assets/gawr_gura.png")
     image = Image.open(image_path)
     image = image.resize((100, 100), Image.Resampling.LANCZOS)
     photo = ImageTk.PhotoImage(image)
@@ -1020,8 +1020,8 @@ def show_epic_tab():
             from tkvideo import tkvideo
             from playsound import playsound
 
-            video_path = resource_path("edit.mp4")
-            audio_path = resource_path("edit_audio.mp3")
+            video_path = resource_path("assets/edit.mp4")
+            audio_path = resource_path("assets/edit_audio.mp3")
 
             player = VideoPlayer(video_path, video_label, loop=0, size=(640, 360))
             player.play()
