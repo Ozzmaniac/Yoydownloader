@@ -9,7 +9,7 @@ from tkinter import messagebox
 
 VERSION = "2.0.8"
 VERSION_URL = "https://raw.githubusercontent.com/Ozzmaniac/Yoydownloader/main/version.txt"
-ZIP_URL = "https://github.com/Ozzmaniac/Yoydownloader/releases/download/v2.0.7/yoydownloader.zip"
+ZIP_URL = "https://github.com/Ozzmaniac/Yoydownloader/releases/latest/download/yoydownloader.zip"
 
 
 def check_for_update():
