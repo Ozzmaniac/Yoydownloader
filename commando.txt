@@ -1,0 +1,7 @@
+pyinstaller --onefile --noconsole --icon=gura.ico ^
+--add-data "gawr_gura.png;." ^
+--add-data "gura.ico;." ^
+--add-data "HyliaSerif.otf;." ^
+--add-data "edit.webm;." ^
+--add-data "edit_audio.mp3;." ^
+yoydownloader.py

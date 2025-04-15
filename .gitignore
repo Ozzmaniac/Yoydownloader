@@ -1,0 +1,17 @@
+# Ignore Python cache and compiled files
+__pycache__/
+*.py[cod]
+
+# Ignore virtual environments
+venv/
+env/
+
+# Ignore Windows hidden files
+Thumbs.db
+.DS_Store
+
+# Ignore builds and PyInstaller output
+*.spec
+dist/
+build/
+*.exe
