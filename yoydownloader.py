@@ -18,8 +18,16 @@ from playsound import playsound as play_audio
 import threading
 from updater import check_for_update, run_updater, perform_update, VERSION
 
+# === Config Path Setup ===
+APP_NAME = "Yoydownloader"
+CONFIG_FILENAME = "yoydownloader_config.json"
+CONFIG_PATH = os.path.join(os.getenv("APPDATA"), APP_NAME, CONFIG_FILENAME)
+
+# Ensure the folder exists
+os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+
 #VER NUMBER
-VERSION = "2.0.7"
+VERSION = "2.0.8"
 
 # Handle update mode
 if "--update" in sys.argv and len(sys.argv) > 2:
@@ -75,51 +83,44 @@ def save_config():
         "download_directory": download_directory
     }
     try:
-        with open(CONFIG_FILE, 'w') as f:
+        with open(CONFIG_PATH, 'w') as f:
             json.dump(config, f)
     except Exception as e:
         console_output.insert(tk.END, f"Error saving configuration: {e}\n")
         console_output.see(tk.END)
 
-# Function to load configuration
+
 def load_config():
     global link_channel_path, saved_directory, selected_spreadsheet_path, download_directory, selected_file
     try:
-        if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, 'r') as f:
+        if os.path.exists(CONFIG_PATH):
+            with open(CONFIG_PATH, 'r') as f:
                 config = json.load(f)
                 
-                # Load Link Channel path
-                if "link_channel_path" in config and config["link_channel_path"] is not None and os.path.exists(config["link_channel_path"]):
+                if "link_channel_path" in config and config["link_channel_path"] and os.path.exists(config["link_channel_path"]):
                     link_channel_path = config["link_channel_path"]
                     folder_label.config(text=f"Selected: {link_channel_path}")
                     update_character_dropdown()
                     update_link_alt_dropdown()
                 
-                # Load saved directory
-                if "saved_directory" in config and config["saved_directory"] is not None and os.path.exists(config["saved_directory"]):
+                if "saved_directory" in config and config["saved_directory"] and os.path.exists(config["saved_directory"]):
                     saved_directory = config["saved_directory"]
                     save_dir_label.config(text=f"Save to: {saved_directory}")
                 
-                # Load spreadsheet path
-                if "selected_spreadsheet_path" in config and config["selected_spreadsheet_path"] is not None and os.path.exists(config["selected_spreadsheet_path"]):
+                if "selected_spreadsheet_path" in config and config["selected_spreadsheet_path"] and os.path.exists(config["selected_spreadsheet_path"]):
                     selected_spreadsheet_path = config["selected_spreadsheet_path"]
                     selected_file = selected_spreadsheet_path
                     filename = os.path.basename(selected_spreadsheet_path)
                     spreadsheet_status_label_downloader.config(text=f"Spreadsheet Loaded: {filename}", fg="green")
                     spreadsheet_status_label.config(text=f"Spreadsheet Loaded: {filename}", fg="green")
-                    
-                    # Load data for thumbnail generator
                     populate_dropdowns_from_excel(selected_spreadsheet_path)
 
-                
-                # Load download directory
-                if "download_directory" in config and config["download_directory"] is not None and os.path.exists(config["download_directory"]):
+                if "download_directory" in config and config["download_directory"] and os.path.exists(config["download_directory"]):
                     download_directory = config["download_directory"]
     except Exception as e:
         console_output.insert(tk.END, f"Error loading configuration: {e}\n")
         console_output.see(tk.END)
-        
+
         
 #Base window creation
 root = tk.Tk()
