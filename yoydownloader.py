@@ -16,39 +16,42 @@ from tkinter import Tk, Label
 from tkvideo import tkvideo as VideoPlayer
 from playsound import playsound as play_audio
 import threading
-from updater import get_latest_release_info, run_updater
+from updater import check_for_update, run_updater, perform_update, VERSION
 
 #VER NUMBER
-VERSION = "2.0.6"
+VERSION = "2.0.7"
+
+# Handle update mode
+if "--update" in sys.argv and len(sys.argv) > 2:
+    from updater import perform_update
+    perform_update(sys.argv[2])
+    sys.exit(0)
 
 
 
 #Auto Updater
+from tkinter import messagebox, Toplevel
+
 def check_for_updates_at_launch():
     try:
-        latest_version, zip_url = get_latest_release_info()
-        if latest_version and latest_version != VERSION:
-            result = messagebox.askyesno(
-                "Update Available",
-                f"A new version ({latest_version}) is available.\nDo you want to update now?"
-            )
-            if result:
-                run_updater(zip_url)
+        latest_version = check_for_update()
+        if latest_version:
+            # Delay prompt slightly to let main root fully load
+            root.after(100, lambda: prompt_update(latest_version))
     except Exception as e:
         print(f"[Auto-Updater] Failed to check for updates: {e}")
 
-
-
-
-
-latest_version, zip_url = get_latest_release_info()
-if latest_version and latest_version != "2.0.6":  # Match LOCAL_VERSION
+def prompt_update(latest_version):
+    # This runs after main window is ready
     result = messagebox.askyesno(
         "Update Available",
         f"A new version ({latest_version}) is available.\nDo you want to update now?"
     )
     if result:
-        run_updater(zip_url)
+        run_updater()
+
+
+
 
 #Resource Path 
 def resource_path(relative_path):
