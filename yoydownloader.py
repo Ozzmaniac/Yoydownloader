@@ -16,14 +16,17 @@ from tkinter import Tk, Label
 from tkvideo import tkvideo as VideoPlayer
 from playsound import playsound as play_audio
 import threading
-from updater import check_for_update, run_updater
+from updater import get_latest_release_info, run_updater
 
-latest = check_for_update()
-if latest:
-    from tkinter import messagebox
-    result = messagebox.askyesno("Update Available", f"A new version ({latest}) is available.\nDo you want to update now?")
+#Auto Updater
+latest_version, zip_url = get_latest_release_info()
+if latest_version and latest_version != "2.0.6":  # Match LOCAL_VERSION
+    result = messagebox.askyesno(
+        "Update Available",
+        f"A new version ({latest_version}) is available.\nDo you want to update now?"
+    )
     if result:
-        run_updater(latest)
+        run_updater(zip_url)
 
 #Resource Path 
 def resource_path(relative_path):
