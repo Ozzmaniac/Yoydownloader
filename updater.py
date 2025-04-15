@@ -6,8 +6,8 @@ import tempfile
 import shutil
 import subprocess
 
-VERSION_URL = "https://raw.githubusercontent.com/Ozzmaniac/Yoydownloader/main/version.txt"
-RELEASE_ZIP_URL = "https://github.com/Ozzmaniac/Yoydownloader/releases/download/v2.0.6/yoydownloader_v2.0.6.zip"
+VERSION_URL = "https://github.com/Ozzmaniac/Yoydownloader-2.0.6/blob/main/version.txt"
+RELEASE_ZIP_URL = "https://github.com/Ozzmaniac/Yoydownloader-2.0.6/releases/download/v2.0.6/yoydownloader.rar"
 LOCAL_VERSION = "2.0.6"  # Must match the current version
 
 def check_for_update():
