@@ -714,94 +714,116 @@ def save_thumbnail():
         log_message(f"Thumbnail saved successfully\n")
 
 def save_thumbnail_as_psd():
-    """Saves the thumbnail as a layered PSD file"""
+    """Save PSD with fully separate editable layers"""
     global saved_directory
-    
+
     from psd_tools.api.psd_image import PSDImage
     from psd_tools.api.layers import PixelLayer
     from PIL import ImageFont, ImageDraw, Image
-    
+
     if not saved_directory:
         select_save_directory()
-        if not saved_directory:  # User cancelled
+        if not saved_directory:
             return
-    
-    thumbnail = _generate_thumbnail_sync()
-    if not thumbnail:
-        log_message("Failed to generate thumbnail for PSD\n")
-        return
-    
-    opponent_name = opponent_var.get()
-    psd_path = os.path.join(saved_directory, f"{opponent_name or 'Unnamed'}.psd")
-    
+
     try:
-        # Create base PSD
-        psd = PSDImage.new(mode="RGBA", size=(1280, 720), color=(0, 0, 0, 0))
-        
-        # Add background layer
-        bg_layer = PixelLayer.frompil(thumbnail.copy(), psd)
+        # Load background fresh (not merged)
+        bg_path = os.path.join(link_channel_path, "Background layouts", f"BG {random.randint(1,5)}.png")
+        background = Image.open(bg_path).resize((1280, 720))
+
+        # Load characters fresh (not merged)
+        link_path = os.path.join(link_channel_path, "Transparent cast", "Link alts", f"{link_skin_var.get()}.png")
+        opp_path  = os.path.join(link_channel_path, "Transparent cast", "Rest of cast", f"{character_var.get()}.png")
+
+        link_img = Image.open(link_path)
+        opp_img  = Image.open(opp_path)
+
+        # Flip/position logic
+        link_pos = positions["link_center_P1"] if link_position_var.get()=="P1" else positions["link_center_P2"]
+        opp_pos  = positions["opponent_center_P2"] if link_position_var.get()=="P1" else positions["opponent_center_P1"]
+
+        if link_position_var.get() == "P2":
+            link_img = link_img.transpose(Image.FLIP_LEFT_RIGHT)
+        else:
+            opp_img = opp_img.transpose(Image.FLIP_LEFT_RIGHT)
+
+        # Create empty PSD
+        psd = PSDImage.new(mode="RGBA", size=(1280, 720))
+
+        # 1 — Background layer
+        bg_layer = PixelLayer.frompil(background, psd)
         bg_layer.name = "Background"
         psd.append(bg_layer)
-        
-        # Add text layers
-        def create_text_layer(text, position, layer_name, font_size=None):
-            """Helper to create text layers with outline"""
-            text_img = Image.new("RGBA", (1280, 720), (0, 0, 0, 0))
-            draw = ImageDraw.Draw(text_img)
-            
+
+        # 2 — Link Layer
+        link_layer_img = Image.new("RGBA", (1280, 720), (0,0,0,0))
+        link_layer_img.paste(link_img, link_pos, link_img)
+        link_layer = PixelLayer.frompil(link_layer_img, psd)
+        link_layer.name = "Link Render"
+        psd.append(link_layer)
+
+        # 3 — Opponent Layer
+        opp_layer_img = Image.new("RGBA", (1280, 720), (0,0,0,0))
+        opp_layer_img.paste(opp_img, opp_pos, opp_img)
+        opp_layer = PixelLayer.frompil(opp_layer_img, psd)
+        opp_layer.name = "Opponent Render"
+        psd.append(opp_layer)
+
+        # === TEXT LAYER HELPER ===
+        def make_text_layer(text, pos, name, size=None):
             font_path = resource_path("assets/HyliaSerif.otf")
-            if not os.path.exists(font_path):
-                raise FileNotFoundError("Font file missing")
-                
-            size = font_size if font_size else int(font_size_var.get())
+            size = size or int(font_size_var.get())
             outline = int(outline_size_var.get())
+
+            img = Image.new("RGBA", (1280, 720), (0,0,0,0))
+            draw = ImageDraw.Draw(img)
             font = ImageFont.truetype(font_path, size)
-            x, y = position
-            
-            # Draw outline
+            x, y = pos
+
+            # outline
             for dx in range(-outline, outline+1):
                 for dy in range(-outline, outline+1):
-                    draw.text((x+dx, y+dy), text, font=font, fill="black")
-            
-            # Draw main text
-            draw.text(position, text, font=font, fill="white")
-            
-            layer = PixelLayer.frompil(text_img, psd)
-            layer.name = layer_name
+                    draw.text((x+dx,y+dy), text, font=font, fill="black")
+
+            draw.text(pos, text, font=font, fill="white")
+
+            layer = PixelLayer.frompil(img, psd)
+            layer.name = name
             return layer
-        
-        # Add all text elements
-        psd.append(create_text_layer(
+
+        # 4 — Tournament title layer
+        psd.append(make_text_layer(
             tournament_entry.get(),
             positions["tournament_title"],
-            "Tournament Title"
+            "Tournament Name"
         ))
-        
-        psd.append(create_text_layer(
+
+        # 5 — Round info layer
+        psd.append(make_text_layer(
             round_entry.get(),
             positions["round_info"],
             "Round Info",
             int(round_font_size_var.get())
         ))
-        
-        psd.append(create_text_layer(
-            link_player_var.get(),
-            positions["link_name_P1"] if link_position_var.get() == "P1" else positions["link_name_P2"],
-            "Link Player"
-        ))
-        
-        psd.append(create_text_layer(
-            opponent_var.get(),
-            positions["opponent_name_P2"] if link_position_var.get() == "P1" else positions["opponent_name_P1"],
-            "Opponent Name"
-        ))
-        
-        # Save final PSD
-        psd.save(psd_path)
-        log_message(f"✅ PSD saved: {os.path.basename(psd_path)}\n")
-        
+
+        # 6 — Link player text
+        link_name_pos = positions["link_name_P1"] if link_position_var.get()=="P1" else positions["link_name_P2"]
+        psd.append(make_text_layer(link_player_var.get(), link_name_pos, "Link Player Name"))
+
+        # 7 — Opponent player text
+        opp_name_pos = positions["opponent_name_P2"] if link_position_var.get()=="P1" else positions["opponent_name_P1"]
+        psd.append(make_text_layer(opponent_var.get(), opp_name_pos, "Opponent Name"))
+
+        # Save PSD
+        opponent_name = opponent_var.get() or "unnamed"
+        out_path = os.path.join(saved_directory, f"{opponent_name}.psd")
+        psd.save(out_path)
+
+        log_message(f"PSD saved: {out_path}\n")
+
     except Exception as e:
-        log_message(f"❌ PSD save failed: {str(e)}\n")
+        log_message(f"PSD failed: {e}\n")
+
 
 #UI elements for the thumbnail tab
 
