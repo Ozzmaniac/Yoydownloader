@@ -1,56 +1,160 @@
+"""
+YOYDOWNLOADER 2.1.0 - CUSTOMTKINTER CONVERSION (Optimized + CTkImage preview)
+- Uses CTkImage for preview to avoid HighDPI CTkLabel warnings
+- Progress bar uses pack() (no grid/pack mixing)
+- Buffered console logging to avoid UI thrashing
+- Reduced UI queue polling from 33ms -> 100ms
+- Throttled progress updates from yt-dlp
+- Keeps original backend logic intact
+"""
 
 import os
 import random
 import pandas as pd
 import subprocess
 import tkinter as tk
-from tkinter import filedialog, ttk, messagebox
+from tkinter import filedialog, messagebox, Toplevel
+import customtkinter as ctk
 from threading import Thread
 import sys
 import platform
-from PIL import ImageTk, Image
+from PIL import Image, ImageTk, ImageFont, ImageDraw
 import json
 import re
-import time
 import queue
-from tkinter import Tk, Label
 from tkvideo import tkvideo as VideoPlayer
 from playsound import playsound as play_audio
-import threading
 from updater import check_for_update, run_updater, perform_update, VERSION
+from functools import lru_cache
+from psd_tools.api.psd_image import PSDImage
+from psd_tools.api.layers import PixelLayer
+from customtkinter import CTkImage
+import time as _time
 
-# === Config Path Setup ===
+# === Constants ===
 APP_NAME = "Yoydownloader"
 CONFIG_FILENAME = "yoydownloader_config.json"
-CONFIG_PATH = os.path.join(os.getenv("APPDATA"), APP_NAME, CONFIG_FILENAME)
+CONFIG_PATH = os.path.join(os.getenv("APPDATA") or os.path.expanduser("~"), APP_NAME, CONFIG_FILENAME)
 
-# Ensure the folder exists
 os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
 
-
-
-# Handle update mode
+# Handle update mode (used by updater)
 if "--update" in sys.argv and len(sys.argv) > 2:
-    from updater import perform_update
     perform_update(sys.argv[2])
     sys.exit(0)
 
+# === Utility functions ===
+def resource_path(relative_path):
+    if hasattr(sys, '_MEIPASS'):
+        return os.path.join(sys._MEIPASS, relative_path)
+    return os.path.join(os.path.abspath("."), relative_path)
 
+# LRU cache for images and fonts
+@lru_cache(maxsize=256)
+def load_image(path):
+    return Image.open(path).convert("RGBA")
 
-#Auto Updater
-from tkinter import messagebox, Toplevel
+@lru_cache(maxsize=64)
+def get_font(size):
+    return ImageFont.truetype(resource_path("assets/HyliaSerif.otf"), size)
 
+# === App State (single object to hold global-like state) ===
+class AppState:
+    def __init__(self):
+        self.download_canceled = False
+        self.active_process = None
+        self.selected_file = None
+        self.selected_spreadsheet_path = None
+        self.download_directory = ""
+        self.saved_directory = ""
+        self.link_channel_path = ""
+        self.spreadsheet_cache = {}  # path -> DataFrame
+        self.ui_queue = queue.Queue()
+        self.downloader_thread = None
+
+state = AppState()
+
+# Buffered log storage to avoid spamming the textbox
+log_buffer = []
+
+# Convenience UI queue functions (threads should use enqueue_ui)
+def enqueue_ui(func, *args, **kwargs):
+    """
+    Put a callable and its args into the UI queue. If func expects kwargs,
+    it's safest to wrap in a lambda when enqueueing.
+    """
+    state.ui_queue.put((func, args, kwargs))
+
+def _process_ui_queue_once():
+    try:
+        while True:
+            func, args, kwargs = state.ui_queue.get_nowait()
+            try:
+                func(*args, **kwargs)
+            except Exception as e:
+                # Use fallback print if console widget isn't ready
+                try:
+                    console_output.insert("end", f"[UI queue] callback error: {e}\n")
+                    console_output.see("end")
+                except Exception:
+                    print(f"[UI queue] callback error: {e}")
+    except queue.Empty:
+        pass
+
+def process_ui_queue_loop():
+    _process_ui_queue_once()
+    app.after(100, process_ui_queue_loop)  # reduced to 100ms to save CPU
+
+# === Config Save / Load ===
+def save_config():
+    cfg = {
+        "link_channel_path": state.link_channel_path,
+        "saved_directory": state.saved_directory,
+        "selected_spreadsheet_path": state.selected_spreadsheet_path,
+        "download_directory": state.download_directory
+    }
+    try:
+        with open(CONFIG_PATH, 'w') as f:
+            json.dump(cfg, f)
+    except Exception as e:
+        enqueue_ui(log_message, f"Error saving configuration: {e}\n")
+
+def load_config():
+    try:
+        if os.path.exists(CONFIG_PATH):
+            with open(CONFIG_PATH, 'r') as f:
+                cfg = json.load(f)
+            # Apply safely and update UI if necessary
+            if cfg.get("link_channel_path") and os.path.exists(cfg["link_channel_path"]):
+                state.link_channel_path = cfg["link_channel_path"]
+                enqueue_ui(folder_label.configure, text=f"Selected: {state.link_channel_path}")
+                enqueue_ui(update_character_dropdown)
+                enqueue_ui(update_link_alt_dropdown)
+            if cfg.get("saved_directory") and os.path.exists(cfg["saved_directory"]):
+                state.saved_directory = cfg["saved_directory"]
+                enqueue_ui(save_dir_label.configure, text=f"Save to: {state.saved_directory}")
+            if cfg.get("selected_spreadsheet_path") and os.path.exists(cfg["selected_spreadsheet_path"]):
+                state.selected_spreadsheet_path = cfg["selected_spreadsheet_path"]
+                state.selected_file = cfg["selected_spreadsheet_path"]
+                filename = os.path.basename(cfg["selected_spreadsheet_path"])
+                enqueue_ui(spreadsheet_status_label_downloader.configure, text=f"Spreadsheet Loaded: {filename}", fg_color="transparent")
+                enqueue_ui(spreadsheet_status_label.configure, text=f"Spreadsheet Loaded: {filename}", fg_color="transparent")
+                enqueue_ui(populate_dropdowns_from_excel, cfg["selected_spreadsheet_path"])
+            if cfg.get("download_directory") and os.path.exists(cfg["download_directory"]):
+                state.download_directory = cfg["download_directory"]
+    except Exception as e:
+        enqueue_ui(log_message, f"Error loading configuration: {e}\n")
+
+# === Updater logic (start after app created) ===
 def check_for_updates_at_launch():
     try:
         latest_version = check_for_update()
         if latest_version:
-            # Delay prompt slightly to let main root fully load
-            root.after(100, lambda: prompt_update(latest_version))
+            app.after(100, lambda: prompt_update(latest_version))
     except Exception as e:
         print(f"[Auto-Updater] Failed to check for updates: {e}")
 
 def prompt_update(latest_version):
-    # This runs after main window is ready
     result = messagebox.askyesno(
         "Update Available",
         f"A new version ({latest_version}) is available.\nDo you want to update now?"
@@ -58,132 +162,78 @@ def prompt_update(latest_version):
     if result:
         run_updater()
 
+# === Initialize CustomTkinter appearance ===
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("blue")
 
+# === Basic UI setup ===
+app = ctk.CTk()
+app.title(f"YoyDownloader v{VERSION}")
+app.geometry("1100x700")
 
-
-#Resource Path 
-def resource_path(relative_path):
-    if hasattr(sys, '_MEIPASS'):
-        return os.path.join(sys._MEIPASS, relative_path)
-    return os.path.join(os.path.abspath("."), relative_path)
-
-# Global variables
-CONFIG_FILE = "yoydownloader_config.json"
-download_speed = "0 KiB/s"
-download_eta = "Unknown"
-active_process = None
-download_canceled = False
-
-# Function to save configuration
-def save_config():
-    config = {
-        "link_channel_path": link_channel_path,
-        "saved_directory": saved_directory,
-        "selected_spreadsheet_path": selected_spreadsheet_path,
-        "download_directory": download_directory
-    }
-    try:
-        with open(CONFIG_PATH, 'w') as f:
-            json.dump(config, f)
-    except Exception as e:
-        console_output.insert(tk.END, f"Error saving configuration: {e}\n")
-        console_output.see(tk.END)
-
-
-def load_config():
-    global link_channel_path, saved_directory, selected_spreadsheet_path, download_directory, selected_file
-    try:
-        if os.path.exists(CONFIG_PATH):
-            with open(CONFIG_PATH, 'r') as f:
-                config = json.load(f)
-                
-                if "link_channel_path" in config and config["link_channel_path"] and os.path.exists(config["link_channel_path"]):
-                    link_channel_path = config["link_channel_path"]
-                    folder_label.config(text=f"Selected: {link_channel_path}")
-                    update_character_dropdown()
-                    update_link_alt_dropdown()
-                
-                if "saved_directory" in config and config["saved_directory"] and os.path.exists(config["saved_directory"]):
-                    saved_directory = config["saved_directory"]
-                    save_dir_label.config(text=f"Save to: {saved_directory}")
-                
-                if "selected_spreadsheet_path" in config and config["selected_spreadsheet_path"] and os.path.exists(config["selected_spreadsheet_path"]):
-                    selected_spreadsheet_path = config["selected_spreadsheet_path"]
-                    selected_file = selected_spreadsheet_path
-                    filename = os.path.basename(selected_spreadsheet_path)
-                    spreadsheet_status_label_downloader.config(text=f"Spreadsheet Loaded: {filename}", fg="green")
-                    spreadsheet_status_label.config(text=f"Spreadsheet Loaded: {filename}", fg="green")
-                    populate_dropdowns_from_excel(selected_spreadsheet_path)
-
-                if "download_directory" in config and config["download_directory"] and os.path.exists(config["download_directory"]):
-                    download_directory = config["download_directory"]
-    except Exception as e:
-        console_output.insert(tk.END, f"Error loading configuration: {e}\n")
-        console_output.see(tk.END)
-
-        
-#Base window creation
-root = tk.Tk()
-check_for_updates_at_launch()
-root.title(f"YoyDownloader v{VERSION}")
-root.configure(bg="#2e2e2e")  
-
-# Set program icon
+# Set icon
 icon_path = resource_path("assets/gura.ico")
 try:
     if platform.system() == "Windows":
-        root.iconbitmap(default=icon_path)
+        app.iconbitmap(default=icon_path)
     else:
         img = tk.PhotoImage(file=icon_path)
-        root.tk.call('wm', 'iconphoto', root._w, img)
+        app.tk.call('wm', 'iconphoto', app._w, img)
 except Exception as e:
     print(f"Failed to load icon: {e}")
 
+# === Buffered logging utilities ===
+def log_message(message):
+    """
+    Buffer messages instead of writing them immediately to the textbox.
+    A scheduled flusher will push them into the console widget at a reduced rate.
+    """
+    global log_buffer
+    if not isinstance(message, str):
+        try:
+            message = str(message)
+        except Exception:
+            message = "<unprintable message>\n"
+    log_buffer.append(message)
+    # Keep buffer reasonably sized
+    if len(log_buffer) > 2000:
+        log_buffer = log_buffer[-1000:]
 
-#Parse Timestamps
+def flush_logs():
+    """
+    Periodically flush log_buffer to the console widget. Runs on the main thread.
+    """
+    global log_buffer
+    try:
+        if log_buffer:
+            try:
+                console_output.insert("end", "".join(log_buffer))
+                console_output.see("end")
+            except Exception:
+                print("".join(log_buffer))
+            log_buffer = []
+    except Exception as e:
+        try:
+            print(f"[flush_logs] {e}")
+        except:
+            pass
+    app.after(100, flush_logs)
+
+# === Parsing timestamps ===
 def parse_timestamps(timestamp):
-    if pd.isna(timestamp) or timestamp.lower() == "full vid":
-        return None, None  
-    if '-' in timestamp:
-        parts = timestamp.split('-')
+    if pd.isna(timestamp) or str(timestamp).lower() == "full vid":
+        return None, None
+    if '-' in str(timestamp):
+        parts = str(timestamp).split('-')
         if len(parts) != 2:
-            log_message(f"Invalid timestamp format: {timestamp}\n")
+            enqueue_ui(log_message, f"Invalid timestamp format: {timestamp}\n")
             return None, None
         start_time, end_time = parts
     else:
-        start_time = timestamp
-        end_time = "inf"  
+        start_time = str(timestamp)
+        end_time = "inf"
     return start_time.strip(), end_time.strip()
 
-
-# Global flag to track if downloads should be canceled
-def cancel_download():
-    #Reassigning global flags
-    global download_canceled, active_process
-    
-    # Ask for confirmation
-    if messagebox.askyesno("Cancel Download", "Are you sure you want to cancel the download?"):
-        download_canceled = True
-        console_output.insert(tk.END, "Canceling download...\n")
-        console_output.see(tk.END)
-        
-        # Terminate the active process if exists
-        if active_process and active_process.poll() is None:
-            if platform.system() == "Windows":
-                subprocess.run(['taskkill', '/F', '/T', '/PID', str(active_process.pid)], 
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            else:
-                active_process.terminate()
-                progress_bar.pack_forget()
-
-                
-        progress_label.config(text="Download canceled")
-        # Re-enable the download button
-        download_button.config(state=tk.NORMAL)
-        cancel_button.config(state=tk.DISABLED)
-
-
-#Helper
 def format_eta(seconds):
     if not isinstance(seconds, (int, float)) or seconds < 0 or seconds > 86400:
         return "Unknown"
@@ -191,41 +241,60 @@ def format_eta(seconds):
     h, m = divmod(m, 60)
     return f"{h}:{m:02}:{s:02}" if h else f"{m}:{s:02}"
 
+# === Thread-safe downloader pipeline ===
+def safe_terminate_process(proc):
+    try:
+        if proc.poll() is None:
+            if platform.system() == "Windows":
+                subprocess.run(['taskkill', '/F', '/T', '/PID', str(proc.pid)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=0.5)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+    except Exception as e:
+        enqueue_ui(log_message, f"Failed to kill process: {e}\n")
 
-
-
-#Download VOD function
-progress_queue = queue.Queue()
-
-def download_vod(url, start_time, end_time, output_filename, index, total, callback=None):
-    global download_canceled, active_process, download_speed
-
-    if download_canceled:
+# download_vod: unchanged logic but throttles UI updates and uses proper progress scale
+def download_vod(url, start_time, end_time, output_filename, index, total, on_complete=None):
+    if state.download_canceled:
         return
 
     command = ["yt-dlp", "-f", "bestvideo+bestaudio/best", "--newline"]
     if start_time and end_time:
         command += ["--download-sections", f"*{start_time}-{end_time}"]
-    command += ["-o", os.path.join(download_directory, output_filename), url]
+    command += ["-o", os.path.join(state.download_directory, output_filename), url]
 
     startupinfo = None
     if platform.system() == "Windows":
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
 
-    active_process = subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        universal_newlines=True,
-        startupinfo=startupinfo
-    )
+    try:
+        proc = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            universal_newlines=True,
+            startupinfo=startupinfo
+        )
+        state.active_process = proc
+    except Exception as e:
+        enqueue_ui(log_message, f"Failed to start yt-dlp: {e}\n")
+        state.active_process = None
+        if on_complete:
+            enqueue_ui(on_complete)
+        return
 
-    current_percent = 0
+    current_percent = 0.0
     is_section_download = start_time and end_time
-    q = queue.Queue()
 
     def time_to_sec(t):
         parts = t.split(':')
@@ -237,672 +306,590 @@ def download_vod(url, start_time, end_time, output_filename, index, total, callb
             return int(m)*60 + float(s)
         return 0
 
-    def reader_thread():
-        nonlocal current_percent
-        for line in active_process.stdout:
-            if download_canceled:
-                break
-            q.put(line)
-        active_process.wait()
-        
+    # Throttle updates so the UI does not get spammed
+    last_reported_percent = -1.0
+    last_report_time = _time.time()
 
-    def ui_updater():
-        nonlocal current_percent
+    def reader_thread():
+        nonlocal current_percent, last_reported_percent, last_report_time
         try:
-            while True:
-                line = q.get_nowait()
-                if line is None:
+            for raw_line in proc.stdout:
+                if state.download_canceled:
                     break
-                log_message(line)
+                line = raw_line.rstrip("\n")
+                # Buffer logs instead of inserting directly
+                enqueue_ui(log_message, line + "\n")
+
+                # Parse typical yt-dlp download progress lines
                 if "[download]" in line and "%" in line:
-                    m = re.search(r'([\d.]+)%.*?of.*?at\s+([\d.]+\w+/s)\s+ETA\s+([\d:]+)', line)
+                    m = re.search(r'([\d.]+)%', line)
                     if m:
-                        current_percent = float(m.group(1))
-                        speed = m.group(2)
-                        eta = m.group(3)
-                        progress_bar["value"] = current_percent
-                        progress_label.config(
-                            text=f"Downloading {index+1}/{total}: {output_filename} | {current_percent:.1f}% | Speed: {speed} | ETA: {eta}"
-                        )
+                        try:
+                            new_percent = float(m.group(1))
+                            current_percent = new_percent
+                        except Exception:
+                            pass
+
+                        # throttle: update UI only when percent changed by >= 0.5 or every 0.4s
+                        now = _time.time()
+                        if abs(current_percent - last_reported_percent) >= 0.5 or (now - last_report_time) >= 0.4:
+                            last_reported_percent = current_percent
+                            last_report_time = now
+                            # progress_bar requires 0.0 - 1.0
+                            enqueue_ui(progress_bar.set, min(1.0, max(0.0, current_percent / 100.0)))
+                            enqueue_ui(progress_label.configure, text=f"Downloading {index+1}/{total}: {output_filename} | {current_percent:.1f}%")
                 elif is_section_download and "time=" in line:
+                    # For section downloads, try to estimate percent
                     time_match = re.search(r'time=([\d:.]+)', line)
                     speed_match = re.search(r'speed=\s*([\d.]+x|\d+\.?\d*\s*\w+/s)', line)
                     if time_match:
-                        current_time = time_to_sec(time_match.group(1))
-                        start_sec = time_to_sec(start_time or "0:00")
-                        end_sec = time_to_sec(end_time) if end_time and end_time.lower() != "inf" else float('inf')
-                        if end_sec == float('inf') or current_time < start_sec:
-                            current_percent = min(100, current_percent + 0.5)
-                            eta = "Unknown"
-                        else:
-                            duration = max(1, end_sec - start_sec)
-                            current_percent = max(0, min(100, ((current_time - start_sec) / duration) * 100))
-                            remaining = max(0, end_sec - current_time)
-                            if speed_match and "x" in speed_match.group(1):
-                                speed_factor = float(speed_match.group(1).replace("x", ""))
-                                eta = format_eta(remaining / speed_factor)
-                            else:
+                        try:
+                            current_time = time_to_sec(time_match.group(1))
+                            start_sec = time_to_sec(start_time or "0:00")
+                            end_sec = time_to_sec(end_time) if end_time and end_time.lower() != "inf" else float('inf')
+                            if end_sec == float('inf') or current_time < start_sec:
+                                # can't compute reliably; advance slowly
+                                current_percent = min(100, current_percent + 0.5)
                                 eta = "Unknown"
-                        speed = speed_match.group(1).strip() if speed_match else "N/A"
-                        progress_bar["value"] = current_percent
-                        progress_label.config(
-                            text=f"Downloading {index+1}/{total}: {current_percent:.1f}% | Speed: {speed} | ETA: {eta}"
-                        )
-        except queue.Empty:
-            pass
+                            else:
+                                duration = max(1, end_sec - start_sec)
+                                current_percent = max(0, min(100, ((current_time - start_sec) / duration) * 100))
+                                remaining = max(0, end_sec - current_time)
+                                if speed_match and "x" in speed_match.group(1):
+                                    try:
+                                        speed_factor = float(speed_match.group(1).replace("x", ""))
+                                        eta = format_eta(remaining / speed_factor)
+                                    except Exception:
+                                        eta = "Unknown"
+                                else:
+                                    eta = "Unknown"
+                            speed = speed_match.group(1).strip() if speed_match else "N/A"
 
-        if active_process.poll() is None:
-            root.after(100, ui_updater)
-        else:
-            if not download_canceled:
-                progress_bar["value"] = 100
-                progress_label.config(text=f"Post-processing {index+1}/{total}: {output_filename}...")
-
-                def finalize():
-                    progress_label.config(text=f"Finished {index+1}/{total}: {output_filename}")
-                    if callback:
-                        callback()
-
-                root.after(1000, finalize)  # Show "Post-processing..." briefly
+                            now = _time.time()
+                            if abs(current_percent - last_reported_percent) >= 0.5 or (now - last_report_time) >= 0.4:
+                                last_reported_percent = current_percent
+                                last_report_time = now
+                                enqueue_ui(progress_bar.set, min(1.0, max(0.0, current_percent / 100.0)))
+                                enqueue_ui(progress_label.configure, text=f"Downloading {index+1}/{total}: {current_percent:.1f}% | Speed: {speed} | ETA: {eta}")
+                        except Exception:
+                            pass
+            proc.wait()
+        except Exception as e:
+            enqueue_ui(log_message, f"[download reader error] {e}\n")
+        finally:
+            state.active_process = None
+            if not state.download_canceled:
+                # Ensure progress hits 100%
+                enqueue_ui(progress_bar.set, 1.0)
+                # Post-processing message (ok to show)
+                enqueue_ui(progress_label.configure, text=f"Post-processing {index+1}/{total}: {output_filename}...")
+                def finalize_ui():
+                    # Only display "Finished" for non-final downloads (Option A)
+                    if index + 1 < total:
+                        enqueue_ui(progress_label.configure, text=f"Finished {index+1}/{total}: {output_filename}")
+                    # For final download, we don't overwrite the final "Downloads Complete!" text set by the batch worker
+                    if on_complete:
+                        enqueue_ui(on_complete)
+                enqueue_ui(lambda: app.after(800, finalize_ui))
             else:
-                if callback:
-                    callback()
+                if on_complete:
+                    enqueue_ui(on_complete)
 
-    # Start reading yt-dlp output
     Thread(target=reader_thread, daemon=True).start()
-    # Start periodic GUI update loop
-    root.after(100, ui_updater)
 
+# === Spreadsheet caching & helpers ===
+def load_spreadsheet_cached(path):
+    if path in state.spreadsheet_cache:
+        return state.spreadsheet_cache[path]
+    df = pd.read_excel(path)
+    state.spreadsheet_cache[path] = df
+    return df
 
-last_gui_update_time = 0
+# === Main downloader worker (single worker thread) ===
+def process_spreadsheet_worker():
+    try:
+        state.download_canceled = False
+        enqueue_ui(download_button.configure, state="disabled")
+        enqueue_ui(cancel_button.configure, state="normal")
 
-    
-#Process Spreadsheet
-def process_spreadsheet():
-    global download_canceled, download_speed, download_eta
-    
-    # Reset progress tracking
-    download_speed = "0 KiB/s"
-    download_eta = "Unknown"
-    download_canceled = False
-    
-    # Disable download button, enable cancel button
-    download_button.config(state=tk.DISABLED)
-    cancel_button.config(state=tk.NORMAL)
-    
-    if not selected_file or not download_directory:
-        console_output.insert(tk.END, "Error: No file or directory selected.\n")
-        # Re-enable download button, disable cancel button
-        download_button.config(state=tk.NORMAL)
-        cancel_button.config(state=tk.DISABLED)
-        return
-    
-    df = pd.read_excel(selected_file)
-    df.columns = df.columns.str.strip().str.lower()
-    
-    link_column = next((col for col in df.columns if "twitch link" in col or "vod link" in col), None)
-    timestamp_column = next((col for col in df.columns if "timestamps" in col), None)
-    character_column = next((col for col in df.columns if "opponent" in col), None)
-    
-    if not link_column or not timestamp_column or not character_column:
-        console_output.insert(tk.END, "Error: Required columns not found in spreadsheet.\n")
-        # Re-enable download button, disable cancel button
-        download_button.config(state=tk.NORMAL)
-        cancel_button.config(state=tk.DISABLED)
-        return
-    
-    total_vods = len(df)
-    progress_bar["maximum"] = 100  # Set maximum to 100% for each file
-    progress_bar["value"] = 0
-    
-    
-    completed = 0
-    def run_next(index):
-        if index >= len(df) or download_canceled:
-            finish_download()
-            progress_bar.pack_forget()
+        if not state.selected_file or not state.download_directory:
+            enqueue_ui(log_message, "Error: No file or download directory selected.\n")
+            enqueue_ui(download_button.configure, state="normal")
+            enqueue_ui(cancel_button.configure, state="disabled")
             return
 
-        row = df.iloc[index]
-        vod_url = str(row[link_column]) if not pd.isna(row[link_column]) else ""
-        timestamp = row[timestamp_column]
-        opponent_character = row[character_column]
+        df = load_spreadsheet_cached(state.selected_file)
+        df.columns = df.columns.str.strip().str.lower()
 
-        if not vod_url:
-            console_output.insert(tk.END, f"Skipping row {index + 1}/{total_vods}: No VOD link.\n")
-            console_output.see(tk.END)
-            run_next(index + 1)
+        link_column = next((col for col in df.columns if "twitch link" in col or "vod link" in col), None)
+        timestamp_column = next((col for col in df.columns if "timestamps" in col), None)
+        character_column = next((col for col in df.columns if "opponent" in col), None)
+
+        if not link_column or not timestamp_column or not character_column:
+            enqueue_ui(log_message, "Error: Required columns not found in spreadsheet.\n")
+            enqueue_ui(download_button.configure, state="normal")
+            enqueue_ui(cancel_button.configure, state="disabled")
             return
 
-        output_filename = f"VOD_{index+1}_{opponent_character}.mp4"
-        start_time, end_time = parse_timestamps(timestamp)
+        total_vods = len(df)
+        enqueue_ui(progress_bar.set, 0.0)
 
-        progress_bar["value"] = 0
+        for i in range(len(df)):
+            if state.download_canceled:
+                break
+            row = df.iloc[i]
+            vod_url = str(row[link_column]) if not pd.isna(row[link_column]) else ""
+            timestamp = row[timestamp_column]
+            opponent_character = row[character_column] if not pd.isna(row[character_column]) else "unknown"
 
-        def on_done():
-            root.after(0, lambda: run_next(index + 1))
+            if not vod_url:
+                enqueue_ui(log_message, f"Skipping row {i+1}/{total_vods}: No VOD link.\n")
+                enqueue_ui(lambda: console_output.see("end"))
+                continue
 
-        Thread(target=lambda: download_vod(
-            vod_url, start_time, end_time, output_filename, index, total_vods, on_done),
-            daemon=True
-        ).start()
+            output_filename = f"VOD_{i+1}_{opponent_character}.mp4"
+            start_time, end_time = parse_timestamps(timestamp)
 
-    def finish_download():
-        if download_canceled:
-            progress_label.config(text="Download canceled")
+            download_vod(vod_url, start_time, end_time, output_filename, i, total_vods)
+
+            # Wait while this download runs
+            while state.active_process is not None:
+                if state.download_canceled:
+                    break
+                _time.sleep(0.1)
+
+        if state.download_canceled:
+            enqueue_ui(progress_label.configure, text="Download canceled")
+            enqueue_ui(progress_bar.set, 0.0)
+            # hide bar as canceled
+            enqueue_ui(progress_bar.pack_forget)
         else:
-            progress_label.config(text="Downloads Complete!")
-            console_output.insert(tk.END, "All downloads completed successfully!\n")
-            console_output.see(tk.END)
-        download_button.config(state=tk.NORMAL)
-        cancel_button.config(state=tk.DISABLED)
+            # Final message after ALL VODs finish
+            enqueue_ui(progress_label.configure, text="Downloads Complete!")
+            enqueue_ui(log_message, "All downloads completed successfully!\n")
+            enqueue_ui(lambda: console_output.see("end"))
+            # Hide the progress bar after batch completion
+            enqueue_ui(progress_bar.pack_forget)
+    except Exception as e:
+        enqueue_ui(log_message, f"[process_spreadsheet_worker] {e}\n")
+    finally:
+        enqueue_ui(download_button.configure, state="normal")
+        enqueue_ui(cancel_button.configure, state="disabled")
+        # ensure bar hidden (safety)
+        enqueue_ui(progress_bar.pack_forget)
 
-    run_next(0)
-
-        
-
-#Spreadsheet Reader
-def select_directory():
-    global download_directory
-    download_directory = filedialog.askdirectory()
-    if download_directory:
-        save_config()  # Save configuration after selecting directory
-
-#Start Download
+# Public start download (spawns single background worker)
 def start_download():
-    progress_bar["value"] = 0
-    progress_label.config(text="Starting download...")
-    progress_bar.pack(pady=0)
-    Thread(target=process_spreadsheet).start()
-    download_button.config(state=tk.DISABLED)
-    cancel_button.config(state=tk.NORMAL)
-    
+    enqueue_ui(progress_bar.set, 0.0)
+    enqueue_ui(lambda: progress_bar.pack(pady=4))  # show by packing (no grid usage)
+    enqueue_ui(progress_label.configure, text="Starting download...")
+    if state.downloader_thread and state.downloader_thread.is_alive():
+        enqueue_ui(log_message, "Downloader is already running.\n")
+        return
+    state.downloader_thread = Thread(target=process_spreadsheet_worker, daemon=True)
+    state.downloader_thread.start()
+    enqueue_ui(download_button.configure, state="disabled")
+    enqueue_ui(cancel_button.configure, state="normal")
 
-style = ttk.Style()
-style.theme_use("clam")
-style.configure("TFrame", background="#2e2e2e")
-style.configure("TLabel", background="#2e2e2e", foreground="white")
-style.configure("TButton", background="#444", foreground="white")
-style.configure("Horizontal.TProgressbar", background="#44a")
-style.configure("TNotebook", background="#2e2e2e", borderwidth=0)
-style.configure("TNotebook.Tab", background="#444", foreground="white", padding=5)
-style.configure("Vertical.TScrollbar", background="#444", troughcolor="#222", borderwidth=0, relief="flat")
-style.map("Vertical.TScrollbar", background=[("active", "#666"), ("pressed", "#888")])
-style.map("TNotebook.Tab", background=[("selected", "#666")])
+# Cancel logic
+def cancel_download():
+    if messagebox.askyesno("Cancel Download", "Are you sure you want to cancel the download?"):
+        state.download_canceled = True
+        enqueue_ui(log_message, "Canceling download...\n")
+        if state.active_process:
+            safe_terminate_process(state.active_process)
+        enqueue_ui(progress_label.configure, text="Download canceled")
+        enqueue_ui(download_button.configure, state="normal")
+        enqueue_ui(cancel_button.configure, state="disabled")
+        enqueue_ui(progress_bar.set, 0.0)
+        enqueue_ui(progress_bar.pack_forget)
 
+# === UI Layout ===
+# Use CTkTabview
+main_frame = ctk.CTkFrame(app)
+main_frame.pack(fill="both", expand=True, padx=12, pady=12)
 
+tabview = ctk.CTkTabview(main_frame, width=1000)
+tabview.add("Downloader")
+tabview.add("Thumbnail Generator")
+tabview.add("Console Output")
 
-notebook = ttk.Notebook(root)
-downloader_frame = ttk.Frame(notebook, style="TFrame")
-console_frame = ttk.Frame(notebook, style="TFrame")
-thumbnail_frame = ttk.Frame(notebook, style="TFrame")  
-notebook.add(downloader_frame, text="Downloader")
-notebook.add(thumbnail_frame, text="Thumbnail Generator")
-notebook.add(console_frame, text="Console Output")
-notebook.pack(expand=True, fill="both")
+tabview.pack(expand=True, fill="both", side="top")
 
-# Adjust scaling based on original window size
-def on_resize(event):
-    scale_factor = min(event.width / 1280, event.height / 720) 
-    update_preview(preview_image) if 'preview_image' in globals() else None
-    thumbnail_canvas.configure(scrollregion=thumbnail_canvas.bbox("all")) 
+# Frames for each tab (CTkFrame)
+downloader_frame = ctk.CTkFrame(tabview.tab("Downloader"))
+downloader_frame.pack(expand=True, fill="both", padx=12, pady=12)
 
-    # Resize the preview image dynamically if it exists
-    if 'preview_image' in globals():
-        new_size = (int(640 * scale_factor), int(360 * scale_factor))
-        resized_image = preview_image._PhotoImage__photo.zoom(new_size[0], new_size[1])
-        preview_canvas.config(image=resized_image)
+thumbnail_frame = ctk.CTkFrame(tabview.tab("Thumbnail Generator"))
+thumbnail_frame.pack(expand=True, fill="both", padx=12, pady=12)
 
-    # Resize only widgets that support the "font" option
-    for frame in [downloader_frame, console_frame, thumbnail_frame]:
-        for widget in frame.winfo_children():
-            try:
-                if "font" in widget.keys():  # Only adjust font if the widget supports it
-                    widget.config(font=("Arial", int(12 * scale_factor)))
-            except tk.TclError:
-                pass  # Ignore widgets that don't support fonts
+console_frame = ctk.CTkFrame(tabview.tab("Console Output"))
+console_frame.pack(expand=True, fill="both", padx=12, pady=12)
 
-        
+# Thumbnail tab: use CTkScrollableFrame for scrollable content
+scrollable = ctk.CTkScrollableFrame(thumbnail_frame)
+scrollable.pack(expand=True, fill="both", padx=6, pady=6)
 
-# Thumbnail Generator Frame
-
-# Create a canvas inside the thumbnail frame to enable scrolling
-thumbnail_canvas = tk.Canvas(thumbnail_frame, bg="#2e2e2e", highlightthickness=0)
-scrollbar = ttk.Scrollbar(thumbnail_frame, orient="vertical", command=thumbnail_canvas.yview)
-
-# Create an inner frame to hold all content
-scrollable_frame = ttk.Frame(thumbnail_canvas, style="TFrame")
-
-# Configure the scrollable frame to expand to the full width of the canvas
-def configure_scrollable_frame(event):
-    thumbnail_canvas.itemconfig(window_id, width=event.width)
-thumbnail_canvas.bind("<Configure>", configure_scrollable_frame)
-
-# Move preview_canvas outside of the scrollable area
-preview_canvas = tk.Label(scrollable_frame, bg="#1e1e1e")
+# We'll use CTkLabel with CTkImage for the preview (avoids PIL.PhotoImage warnings)
+preview_canvas = ctk.CTkLabel(scrollable, text="", width=640, height=360)
 preview_canvas.pack(pady=10)
+# store CTkImage reference to avoid GC
+_preview_ctkimage_ref = None
 
-# Create a container frame for all the UI elements to center them
-center_container = ttk.Frame(scrollable_frame, style="TFrame")
-center_container.pack(expand=True, padx=20)
+center_container = ctk.CTkFrame(scrollable)
+center_container.pack(expand=True, padx=20, pady=6)
 
-# Define standard widths for UI elements
-BUTTON_WIDTH = 25
-DROPDOWN_WIDTH = 30
-ENTRY_WIDTH = 30
+BUTTON_WIDTH = 180
+DROPDOWN_WIDTH = 220
+ENTRY_WIDTH = 220
 
-# Ensure the scrollable frame expands properly
-scrollable_frame.bind(
-    "<Configure>",
-    lambda e: thumbnail_canvas.configure(scrollregion=thumbnail_canvas.bbox("all"))
-)
+# === App globals (UI-state) ===
+download_button = None
+cancel_button = None
+progress_bar = None
+progress_label = None
+console_output = None
+spreadsheet_status_label_downloader = None
+spreadsheet_status_label = None
+folder_label = None
+save_dir_label = None
 
-# Embed the scrollable frame inside the canvas
-window_id = thumbnail_canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-thumbnail_canvas.configure(yscrollcommand=scrollbar.set)
-
-
-# Pack the canvas and scrollbar inside the thumbnail tab
-thumbnail_canvas.pack(side="left", fill="both", expand=True, padx=5, pady=5)
-scrollbar.pack(side="right", fill="y", padx=5, pady=5)
-
-# === Global App State ===
-download_directory = ""
-selected_file = None
-selected_spreadsheet_path = None
-saved_directory = None
-link_channel_path = None
-
-
-# Modify the select_link_channel function
-def select_link_channel():
-    global link_channel_path
-    link_channel_path = filedialog.askdirectory()
-    folder_label.config(text=f"Selected: {link_channel_path}")
-    update_character_dropdown()
-    update_link_alt_dropdown()
-    save_config()  # Save configuration after changing path
-
-# Modify the select_save_directory function
-def select_save_directory():
-    global saved_directory
-    saved_directory = filedialog.askdirectory()
-    if saved_directory:
-        save_dir_label.config(text=f"Save to: {saved_directory}")
-        save_config()  # Save configuration after changing path
-
-# Function to update the character selection dropdown
-def update_character_dropdown():
-    if not link_channel_path:
-        return
-    char_folder = os.path.join(link_channel_path, "Transparent cast", "Rest of cast")
-    characters = [f.replace(".png", "") for f in os.listdir(char_folder) if f.endswith(".png")]
-    
-    character_dropdown["values"] = characters  # Ensure dropdown is properly updated
-
-# Function to update the Link alt selection dropdown
-def update_link_alt_dropdown():
-    if not link_channel_path:
-        return
-    link_alt_folder = os.path.join(link_channel_path, "Transparent cast", "Link alts")
-    link_alts = [f.replace(".png", "") for f in os.listdir(link_alt_folder) if f.endswith(".png")]
-    link_skin_dropdown["values"] = link_alts
-
+# === Thumbnail pipeline (unchanged) ===
 positions = {
-    "link_center_P1": (-350, 40),  # Link on left side (P1)
-    "link_center_P2": (350, 40),  # Link on right side (P2)
-    "opponent_center_P1": (-350, 40),  # Opponent on left side (P1)
-    "opponent_center_P2": (350, 40),  # Opponent on right side (P2)
-    "link_name_P1": (186, 610),  # Below Link (Left)
-    "link_name_P2": (922, 610),  # Below Link (Right)
-    "opponent_name_P1": (186, 610),  # Below Opponent (Left)
-    "opponent_name_P2": (922, 610),  # Below Opponent (Right)
-    "tournament_title": (497, 20),  # Centered at the top box
-    "round_info": (602, 87),  # Below tournament title box
+    "link_center_P1": (-350, 40),
+    "link_center_P2": (350, 40),
+    "opponent_center_P1": (-350, 40),
+    "opponent_center_P2": (350, 40),
+    "link_name_P1": (186, 610),
+    "link_name_P2": (922, 610),
+    "opponent_name_P1": (186, 610),
+    "opponent_name_P2": (922, 610),
+    "tournament_title": (497, 20),
+    "round_info": (602, 87),
 }
 
+class ThumbnailComposer:
+    def __init__(self, settings):
+        self.s = settings
+        self.bg_id = settings.get("background_id") or random.randint(1, 5)
 
+    def load_background(self):
+        path = os.path.join(state.link_channel_path, "Background layouts", f"BG {self.bg_id}.png")
+        return load_image(path).resize((1280, 720), Image.Resampling.LANCZOS)
 
-# Thumbnail Generation
+    def load_link(self):
+        name = self.s["link_skin"]
+        path = os.path.join(state.link_channel_path, "Transparent cast", "Link alts", f"{name}.png")
+        img = load_image(path)
+        if self.s["link_pos"] == "P2":
+            img = img.transpose(Image.FLIP_LEFT_RIGHT)
+        return img
 
-def log_message(message):
-    """Thread-safe console output"""
-    console_output.insert(tk.END, message)
-    if int(console_output.index('end-1c').split('.')[0]) > 100:  # Keep last 100 lines
-        console_output.delete(1.0, 2.0)
-    console_output.see(tk.END)
+    def load_opponent(self):
+        name = self.s["opponent_character"]
+        path = os.path.join(state.link_channel_path, "Transparent cast", "Rest of cast", f"{name}.png")
+        img = load_image(path)
+        if self.s["link_pos"] == "P1":
+            img = img.transpose(Image.FLIP_LEFT_RIGHT)
+        return img
+
+    def get_positions(self):
+        link_pos = (positions["link_center_P1"] if self.s["link_pos"] == "P1" else positions["link_center_P2"])
+        opp_pos = (positions["opponent_center_P2"] if self.s["link_pos"] == "P1" else positions["opponent_center_P1"])
+        link_text_pos = (positions["link_name_P1"] if self.s["link_pos"] == "P1" else positions["link_name_P2"])
+        opp_text_pos = (positions["opponent_name_P2"] if self.s["link_pos"] == "P1" else positions["opponent_name_P1"])
+        return {
+            "link_img": link_pos,
+            "opp_img": opp_pos,
+            "link_text": link_text_pos,
+            "opp_text": opp_text_pos,
+            "tournament_text": positions["tournament_title"],
+            "round_text": positions["round_info"],
+        }
+
+    def draw_text(self, base, pos, text, size, outline):
+        font = get_font(size)
+        draw = ImageDraw.Draw(base)
+        x, y = pos
+        for dx in range(-outline, outline + 1):
+            for dy in range(-outline, outline + 1):
+                draw.text((x + dx, y + dy), text, font=font, fill="black")
+        draw.text(pos, text, font=font, fill="white")
+
+    def render_preview(self):
+        bg = self.load_background()
+        link = self.load_link()
+        opp = self.load_opponent()
+        pos = self.get_positions()
+        bg.paste(link, pos["link_img"], link)
+        bg.paste(opp, pos["opp_img"], opp)
+        self.draw_text(bg, pos["tournament_text"], self.s["tournament"], self.s["font_size"], self.s["outline"])
+        self.draw_text(bg, pos["round_text"], self.s["round"], self.s["round_font_size"], self.s["outline"])
+        self.draw_text(bg, pos["link_text"], self.s["link_player"], self.s["font_size"], self.s["outline"])
+        self.draw_text(bg, pos["opp_text"], self.s["opponent_player"], self.s["font_size"], self.s["outline"])
+        return bg
+
+    def render_layers(self):
+        bg = self.load_background()
+        link = self.load_link()
+        opp = self.load_opponent()
+        pos = self.get_positions()
+
+        link_layer = Image.new("RGBA", (1280, 720), (0, 0, 0, 0))
+        link_layer.paste(link, pos["link_img"], link)
+        opp_layer = Image.new("RGBA", (1280, 720), (0, 0, 0, 0))
+        opp_layer.paste(opp, pos["opp_img"], opp)
+
+        text_layers = []
+        def TL(name, text, posn, size):
+            img = Image.new("RGBA", (1280,720), (0,0,0,0))
+            self.draw_text(img, posn, text, size, self.s["outline"])
+            return (name, img)
+
+        text_layers.append(TL("Tournament", self.s["tournament"], pos["tournament_text"], self.s["font_size"]))
+        text_layers.append(TL("Round", self.s["round"], pos["round_text"], self.s["round_font_size"]))
+        text_layers.append(TL("Link Player", self.s["link_player"], pos["link_text"], self.s["font_size"]))
+        text_layers.append(TL("Opponent Player", self.s["opponent_player"], pos["opp_text"], self.s["font_size"]))
+        return {"background": bg, "link": link_layer, "opponent": opp_layer, "text_layers": text_layers}
+
+# === Thumbnail settings collection & generation ===
+def collect_thumbnail_settings():
+    bg_id = random.randint(1, 5)
+    try:
+        return {
+            "tournament": tournament_entry.get(),
+            "round": round_entry.get(),
+            "link_player": link_player_var.get(),
+            "opponent_player": opponent_var.get(),
+            "link_skin": link_skin_var.get(),
+            "opponent_character": character_var.get(),
+            "link_pos": link_position_var.get(),
+            "font_size": int(font_size_var.get()),
+            "round_font_size": int(round_font_size_var.get()),
+            "outline": int(outline_size_var.get()),
+            "background_id": bg_id
+        }
+    except Exception:
+        return {
+            "tournament": tournament_entry.get(),
+            "round": round_entry.get(),
+            "link_player": link_player_var.get(),
+            "opponent_player": opponent_var.get(),
+            "link_skin": link_skin_var.get(),
+            "opponent_character": character_var.get(),
+            "link_pos": link_position_var.get() or "P1",
+            "font_size": int(font_size_var.get() or 50),
+            "round_font_size": int(round_font_size_var.get() or 28),
+            "outline": int(outline_size_var.get() or 1),
+            "background_id": bg_id
+        }
+
 
 def generate_thumbnail():
-    """Main entry point - starts non-blocking generation"""
     Thread(target=_generate_thumbnail_async, daemon=True).start()
 
+
 def _generate_thumbnail_async():
-    """Background thread work for preview updates"""
     try:
-        img = _generate_thumbnail_core()
-        if img:
-            preview_canvas.after(0, lambda: update_preview(img))
+        settings = collect_thumbnail_settings()
+        composer = ThumbnailComposer(settings)
+        img = composer.render_preview()
+        enqueue_ui(update_preview, img)
     except Exception as e:
-        console_output.after(0, lambda: log_message(f"Thumbnail Error: {str(e)}\n"))
-
-def _generate_thumbnail_core():
-    """Core generation logic - returns PIL Image or None"""
-    from PIL import Image, ImageDraw, ImageFont
-    import os
-    # Input validation
-    if not link_channel_path:
-        log_message("Error: No Link Channel folder selected\n")
-        return None
-        
-    opponent_character = character_var.get().strip()
-    if not opponent_character:
-        log_message("Error: Please select an opponent character\n")
-        return None
-
-    # Load background
-    bg_path = os.path.join(link_channel_path, "Background layouts", f"BG {random.randint(1, 5)}.png")
-    try:
-        background = Image.open(bg_path).resize((1280, 720))
-    except Exception as e:
-        log_message(f"Error loading background: {str(e)}\n")
-        return None
-
-    # Load character images
-    link_skin = link_skin_var.get()
-    link_path = os.path.join(link_channel_path, "Transparent cast", "Link alts", f"{link_skin}.png")
-    char_path = os.path.join(link_channel_path, "Transparent cast", "Rest of cast", f"{opponent_character}.png")
-    
-    try:
-        link_image = Image.open(link_path)
-        char_image = Image.open(char_path)
-    except Exception as e:
-        log_message(f"Error loading character images: {str(e)}\n")
-        return None
-
-    # Character positioning
-    if link_position_var.get() == "P2":
-        link_image = link_image.transpose(Image.FLIP_LEFT_RIGHT)
-    elif link_position_var.get() == "P1":
-        char_image = char_image.transpose(Image.FLIP_LEFT_RIGHT)
-
-    # Paste characters
-    draw = ImageDraw.Draw(background)
-    if link_position_var.get() == "P1":
-        background.paste(link_image, positions["link_center_P1"], link_image)
-        background.paste(char_image, positions["opponent_center_P2"], char_image)
-        link_name_pos = positions["link_name_P1"]
-        opponent_name_pos = positions["opponent_name_P2"]
-    else:
-        background.paste(char_image, positions["opponent_center_P1"], char_image)
-        background.paste(link_image, positions["link_center_P2"], link_image)
-        link_name_pos = positions["link_name_P2"]
-        opponent_name_pos = positions["opponent_name_P1"]
-
-    # Text rendering
-    font_path = resource_path("assets/HyliaSerif.otf")
-    if not os.path.exists(font_path):
-        log_message("Error: Missing font file HyliaSerif.otf\n")
-        return None
-
-    def draw_text_with_outline(draw, text, position, custom_size=None):
-        x, y = position
-        size = custom_size if custom_size else int(font_size_var.get())
-        outline = int(outline_size_var.get())
-        font = ImageFont.truetype(font_path, size)
-        
-        # Draw outline
-        for dx in range(-outline, outline+1):
-            for dy in range(-outline, outline+1):
-                draw.text((x+dx, y+dy), text, font=font, fill="black")
-        # Draw main text
-        draw.text(position, text, font=font, fill="white")
-
-    # Draw all text elements
-    try:
-        draw_text_with_outline(draw, tournament_entry.get(), positions["tournament_title"])
-        draw_text_with_outline(draw, round_entry.get(), positions["round_info"], 
-                             int(round_font_size_var.get()))
-        draw_text_with_outline(draw, link_player_var.get(), link_name_pos)
-        draw_text_with_outline(draw, opponent_var.get(), opponent_name_pos)
-    except Exception as e:
-        log_message(f"Text rendering error: {str(e)}\n")
-        return None
-
-    return background
+        enqueue_ui(log_message, f"Thumbnail Error: {e}\n")
 
 
 def _generate_thumbnail_sync():
-    """Blocking version for saving files"""
-    return _generate_thumbnail_core()
+    settings = collect_thumbnail_settings()
+    composer = ThumbnailComposer(settings)
+    return composer.render_preview()
 
+# Updated: use CTkImage for preview to avoid CTkLabel PIL warning (HighDPI)
 def update_preview(thumbnail):
-    """Update the preview canvas"""
-    global preview_image
-    width = thumbnail_frame.winfo_width() - 20
-    height = int(width * (9/16))
-    thumbnail_resized = thumbnail.resize((width, height), Image.Resampling.LANCZOS)
-    preview_image = ImageTk.PhotoImage(thumbnail_resized)
-    preview_canvas.config(image=preview_image, width=width, height=height)
+    """
+    Create a CTkImage from the PIL thumbnail at a fixed preview size and set it on preview_canvas.
+    Using CTkImage avoids the 'Given image is not CTkImage' warning and ensures correct scaling on HighDPI displays.
+    """
+    global _preview_ctkimage_ref
+    try:
+        preview_w = 640
+        preview_h = 360
+        thumbnail_resized = thumbnail.resize((preview_w, preview_h), Image.Resampling.LANCZOS)
+
+        # Create CTkImage (pass PIL.Image directly). CTkImage will handle DPI scaling.
+        ctk_preview = CTkImage(light_image=thumbnail_resized, dark_image=thumbnail_resized, size=(preview_w, preview_h))
+
+        # Assign to label
+        preview_canvas.configure(image=ctk_preview, text="")
+        # Keep reference to avoid GC
+        _preview_ctkimage_ref = ctk_preview
+        preview_canvas._image = ctk_preview
+    except Exception as e:
+        enqueue_ui(log_message, f"Preview update failed: {e}\n")
 
 def preview_fullscreen():
+    # Generate thumbnail synchronously
     thumbnail = _generate_thumbnail_sync()
-    if thumbnail:
-        fullscreen_window = tk.Toplevel()
-        fullscreen_window.title("Fullscreen Preview")
+    if not thumbnail:
+        return
 
-        # Maximize window
-        fullscreen_window.attributes('-fullscreen', True)
+    # Create fullscreen window
+    fullscreen = Toplevel()
+    fullscreen.title("Fullscreen Preview")
+    fullscreen.attributes("-fullscreen", True)
 
-        # Convert image for Tkinter
-        fullscreen_img = ImageTk.PhotoImage(thumbnail)
+    # Ensure window draws before measuring size
+    fullscreen.update_idletasks()
 
-        # Display image in a label
-        img_label = tk.Label(fullscreen_window, image=fullscreen_img)
-        img_label.pack(expand=True, fill="both")
+    screen_w = fullscreen.winfo_width()
+    screen_h = fullscreen.winfo_height()
 
-        # Close on click
-        fullscreen_window.bind("<Escape>", lambda e: fullscreen_window.destroy())
-
-        # Keep reference to avoid garbage collection
-        img_label.image = fullscreen_img
-        
-# Function to save the generated thumbnail
-def save_thumbnail():
-    thumbnail = _generate_thumbnail_sync()
-    if thumbnail and saved_directory:
-        thumbnail.save(os.path.join(saved_directory, f"{opponent_var.get()}.png"))
-        log_message(f"Thumbnail saved successfully\n")
-
-def save_thumbnail_as_psd():
-    """Save PSD with fully separate editable layers"""
-    global saved_directory
-
-    from psd_tools.api.psd_image import PSDImage
-    from psd_tools.api.layers import PixelLayer
-    from PIL import ImageFont, ImageDraw, Image
-
-    if not saved_directory:
-        select_save_directory()
-        if not saved_directory:
+    # Resize image for fullscreen
+    try:
+        resized = thumbnail.resize((screen_w, screen_h), Image.Resampling.LANCZOS)
+        fullscreen_img = CTkImage(light_image=resized, dark_image=resized, size=(screen_w, screen_h))
+        label = ctk.CTkLabel(fullscreen, image=fullscreen_img, text="")
+        label.pack(expand=True, fill="both")
+        label._image = fullscreen_img  # prevent GC
+    except Exception:
+        # fallback: use a slightly smaller PIL->PhotoImage if CTkImage fails
+        try:
+            resized = thumbnail.resize((int(screen_w*0.9), int(screen_h*0.9)), Image.Resampling.LANCZOS)
+            tk_img = ImageTk.PhotoImage(resized)
+            label = ctk.CTkLabel(fullscreen, image=tk_img, text="")
+            label.pack(expand=True, fill="both")
+            label._image = tk_img
+        except Exception as e:
+            enqueue_ui(log_message, f"Fullscreen preview failed: {e}\n")
+            fullscreen.destroy()
             return
 
+    fullscreen.bind("<Escape>", lambda e: fullscreen.destroy())
+
+def save_thumbnail():
+    thumbnail = _generate_thumbnail_sync()
+    if thumbnail and state.saved_directory:
+        try:
+            out = os.path.join(state.saved_directory, f"{opponent_var.get() or 'thumbnail'}.png")
+            thumbnail.save(out)
+            enqueue_ui(log_message, f"Thumbnail saved successfully: {out}\n")
+        except Exception as e:
+            enqueue_ui(log_message, f"Failed saving PNG: {e}\n")
+    else:
+        enqueue_ui(log_message, "No save directory selected.\n")
+
+
+def save_thumbnail_as_psd():
+    if not state.saved_directory:
+        select_save_directory()
+        if not state.saved_directory:
+            return
     try:
-        # Load background fresh (not merged)
-        bg_path = os.path.join(link_channel_path, "Background layouts", f"BG {random.randint(1,5)}.png")
-        background = Image.open(bg_path).resize((1280, 720))
-
-        # Load characters fresh (not merged)
-        link_path = os.path.join(link_channel_path, "Transparent cast", "Link alts", f"{link_skin_var.get()}.png")
-        opp_path  = os.path.join(link_channel_path, "Transparent cast", "Rest of cast", f"{character_var.get()}.png")
-
-        link_img = Image.open(link_path)
-        opp_img  = Image.open(opp_path)
-
-        # Flip/position logic
-        link_pos = positions["link_center_P1"] if link_position_var.get()=="P1" else positions["link_center_P2"]
-        opp_pos  = positions["opponent_center_P2"] if link_position_var.get()=="P1" else positions["opponent_center_P1"]
-
-        if link_position_var.get() == "P2":
-            link_img = link_img.transpose(Image.FLIP_LEFT_RIGHT)
-        else:
-            opp_img = opp_img.transpose(Image.FLIP_LEFT_RIGHT)
-
-        # Create empty PSD
-        psd = PSDImage.new(mode="RGBA", size=(1280, 720))
-
-        # 1 — Background layer
-        bg_layer = PixelLayer.frompil(background, psd)
-        bg_layer.name = "Background"
-        psd.append(bg_layer)
-
-        # 2 — Link Layer
-        link_layer_img = Image.new("RGBA", (1280, 720), (0,0,0,0))
-        link_layer_img.paste(link_img, link_pos, link_img)
-        link_layer = PixelLayer.frompil(link_layer_img, psd)
-        link_layer.name = "Link Render"
-        psd.append(link_layer)
-
-        # 3 — Opponent Layer
-        opp_layer_img = Image.new("RGBA", (1280, 720), (0,0,0,0))
-        opp_layer_img.paste(opp_img, opp_pos, opp_img)
-        opp_layer = PixelLayer.frompil(opp_layer_img, psd)
-        opp_layer.name = "Opponent Render"
-        psd.append(opp_layer)
-
-        # === TEXT LAYER HELPER ===
-        def make_text_layer(text, pos, name, size=None):
-            font_path = resource_path("assets/HyliaSerif.otf")
-            size = size or int(font_size_var.get())
-            outline = int(outline_size_var.get())
-
-            img = Image.new("RGBA", (1280, 720), (0,0,0,0))
-            draw = ImageDraw.Draw(img)
-            font = ImageFont.truetype(font_path, size)
-            x, y = pos
-
-            # outline
-            for dx in range(-outline, outline+1):
-                for dy in range(-outline, outline+1):
-                    draw.text((x+dx,y+dy), text, font=font, fill="black")
-
-            draw.text(pos, text, font=font, fill="white")
-
-            layer = PixelLayer.frompil(img, psd)
-            layer.name = name
-            return layer
-
-        # 4 — Tournament title layer
-        psd.append(make_text_layer(
-            tournament_entry.get(),
-            positions["tournament_title"],
-            "Tournament Name"
-        ))
-
-        # 5 — Round info layer
-        psd.append(make_text_layer(
-            round_entry.get(),
-            positions["round_info"],
-            "Round Info",
-            int(round_font_size_var.get())
-        ))
-
-        # 6 — Link player text
-        link_name_pos = positions["link_name_P1"] if link_position_var.get()=="P1" else positions["link_name_P2"]
-        psd.append(make_text_layer(link_player_var.get(), link_name_pos, "Link Player Name"))
-
-        # 7 — Opponent player text
-        opp_name_pos = positions["opponent_name_P2"] if link_position_var.get()=="P1" else positions["opponent_name_P1"]
-        psd.append(make_text_layer(opponent_var.get(), opp_name_pos, "Opponent Name"))
-
-        # Save PSD
-        opponent_name = opponent_var.get() or "unnamed"
-        out_path = os.path.join(saved_directory, f"{opponent_name}.psd")
+        settings = collect_thumbnail_settings()
+        composer = ThumbnailComposer(settings)
+        layers = composer.render_layers()
+        psd = PSDImage.new(mode="RGBA", size=(1280,720))
+        bg_layer = PixelLayer.frompil(layers['background'], psd); bg_layer.name="Background"; psd.append(bg_layer)
+        link_layer = PixelLayer.frompil(layers['link'], psd); link_layer.name="Link"; psd.append(link_layer)
+        opp_layer = PixelLayer.frompil(layers['opponent'], psd); opp_layer.name="Opponent"; psd.append(opp_layer)
+        for name, img in layers['text_layers']:
+            L = PixelLayer.frompil(img, psd); L.name = name; psd.append(L)
+        opponent_name = opponent_var.get() or 'unnamed'
+        out_path = os.path.join(state.saved_directory, f"{opponent_name}.psd")
         psd.save(out_path)
-
-        log_message(f"PSD saved: {out_path}\n")
-
+        enqueue_ui(log_message, f"✅ PSD saved: {os.path.basename(out_path)}\n")
     except Exception as e:
-        log_message(f"PSD failed: {e}\n")
+        enqueue_ui(log_message, f"❌ PSD save failed: {e}\n")
+
+# === UI Controls for thumbnail tab ===
+folder_button = ctk.CTkButton(center_container, text="Select Link Channel Folder", command=lambda: select_link_channel(), width=BUTTON_WIDTH)
+folder_button.pack(pady=6)
+folder_label = ctk.CTkLabel(center_container, text="No folder selected")
+folder_label.pack(pady=2)
+save_dir_label = ctk.CTkLabel(center_container, text="No save directory selected")
+save_dir_label.pack(pady=2)
 
 
-#UI elements for the thumbnail tab
+def select_link_channel():
+    path = filedialog.askdirectory()
+    if path:
+        state.link_channel_path = path
+        folder_label.configure(text=f"Selected: {path}")
+        update_character_dropdown()
+        update_link_alt_dropdown()
+        save_config()
 
-# Select Channel Folder
-folder_button = tk.Button(center_container, text="Select Link Channel Folder", command=select_link_channel, bg="#444", fg="white")
-folder_button.pack(pady=0)
-folder_button.config(width=BUTTON_WIDTH)
-folder_label = tk.Label(center_container, text="No folder selected", bg="#2e2e2e", fg="white")
-folder_label.pack(pady=0)
 
-# Save Directory Label 
-save_dir_label = tk.Label(center_container, text="No save directory selected", bg="#2e2e2e", fg="white")
-save_dir_label.pack(pady=0)
+def select_save_directory():
+    path = filedialog.askdirectory()
+    if path:
+        state.saved_directory = path
+        save_dir_label.configure(text=f"Save to: {path}")
+        save_config()
 
-# === Helper: Populate dropdowns from spreadsheet ===
+
+def update_character_dropdown():
+    if not state.link_channel_path:
+        return
+    char_folder = os.path.join(state.link_channel_path, "Transparent cast", "Rest of cast")
+    if not os.path.exists(char_folder):
+        return
+    characters = [f.replace(".png", "") for f in os.listdir(char_folder) if f.endswith(".png")]
+    character_dropdown.configure(values=characters)
+
+
+def update_link_alt_dropdown():
+    if not state.link_channel_path:
+        return
+    link_alt_folder = os.path.join(state.link_channel_path, "Transparent cast", "Link alts")
+    if not os.path.exists(link_alt_folder):
+        return
+    link_alts = [f.replace(".png", "") for f in os.listdir(link_alt_folder) if f.endswith(".png")]
+    link_skin_dropdown.configure(values=link_alts)
+
+# Populate dropdowns from spreadsheet (uses cached load)
 def populate_dropdowns_from_excel(file_path):
     try:
-        df = pd.read_excel(file_path)
+        df = load_spreadsheet_cached(file_path)
         df.columns = df.columns.str.strip().str.lower()
-
-        link_players = df.get("link player", []).dropna().tolist()
-        opponents = df.get("opponent", []).dropna().tolist()
-
-        link_player_dropdown["values"] = link_players
-        opponent_dropdown["values"] = opponents
+        link_players = df.get("link player", pd.Series()).dropna().tolist() if "link player" in df.columns else []
+        opponents = df.get("opponent", pd.Series()).dropna().tolist() if "opponent" in df.columns else []
+        link_player_dropdown.configure(values=link_players)
+        opponent_dropdown.configure(values=opponents)
     except Exception as e:
-        console_output.insert(tk.END, f"Error loading spreadsheet data: {e}\n")
-        console_output.see(tk.END)
+        enqueue_ui(log_message, f"Error loading spreadsheet data: {e}\n")
 
-
-
-
-#Spreadsheet Selector
+# === Spreadsheet selection ===
 def select_spreadsheet():
-    global selected_file, selected_spreadsheet_path, df
     file_path = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx")])
-    
     if not file_path:
         return
-        
-    selected_file = file_path
-    selected_spreadsheet_path = file_path
-    
-    # Update both status labels
+    state.selected_file = file_path
+    state.selected_spreadsheet_path = file_path
     filename = os.path.basename(file_path)
-    spreadsheet_status_label_downloader.config(text=f"Spreadsheet Loaded: {filename}", fg="green")
-    spreadsheet_status_label.config(text=f"Spreadsheet Loaded: {filename}", fg="green")
-    
+    spreadsheet_status_label_downloader.configure(text=f"Spreadsheet Loaded: {filename}")
+    spreadsheet_status_label.configure(text=f"Spreadsheet Loaded: {filename}")
     populate_dropdowns_from_excel(file_path)
-
-    
-    # Save configuration after selecting spreadsheet
     save_config()
 
-spreadsheet_status_label = tk.Label(center_container, text="", bg="#2e2e2e", fg="white")
-spreadsheet_status_label.pack(pady=0)    
+spreadsheet_status_label = ctk.CTkLabel(center_container, text="")
+spreadsheet_status_label.pack(pady=4)
+spreadsheet_button = ctk.CTkButton(center_container, text="Select Spreadsheet", command=select_spreadsheet, width=BUTTON_WIDTH)
+spreadsheet_button.pack(pady=4)
 
-# Select Spreadsheet button
-spreadsheet_button = tk.Button(center_container, text="Select Spreadsheet", command=select_spreadsheet, bg="#444", fg="white")
-spreadsheet_button.pack(pady=0)
-spreadsheet_button.config(width=BUTTON_WIDTH)
-
-# === Dropdown Variables ===
+# Dropdown variables & widgets
 link_player_var = tk.StringVar()
 opponent_var = tk.StringVar()
 character_var = tk.StringVar()
 link_skin_var = tk.StringVar()
-link_position_var = tk.StringVar(value="P1")  # Default to P1
+link_position_var = tk.StringVar(value="P1")
 
+link_player_dropdown = ctk.CTkComboBox(center_container, variable=link_player_var, values=[])
+opponent_dropdown = ctk.CTkComboBox(center_container, variable=opponent_var, values=[])
+character_dropdown = ctk.CTkComboBox(center_container, variable=character_var, values=[])
+link_skin_dropdown = ctk.CTkComboBox(center_container, variable=link_skin_var, values=[])
+position_dropdown = ctk.CTkComboBox(center_container, variable=link_position_var, values=["P1", "P2"])
 
-# === Dropdown Widgets ===
-link_player_dropdown = ttk.Combobox(center_container, textvariable=link_player_var)
-opponent_dropdown = ttk.Combobox(center_container, textvariable=opponent_var)
-character_dropdown = ttk.Combobox(center_container, textvariable=character_var)
-link_skin_dropdown = ttk.Combobox(center_container, textvariable=link_skin_var)
-position_dropdown = ttk.Combobox(center_container, textvariable=link_position_var)
-position_dropdown["values"] = ["P1", "P2"]
-
-# === Display Dropdowns and Labels ===
 dropdown_fields = [
     ("Link Player:", link_player_dropdown),
     ("Opponent Name:", opponent_dropdown),
@@ -912,14 +899,16 @@ dropdown_fields = [
 ]
 
 for label_text, dropdown in dropdown_fields:
-    label = tk.Label(center_container, text=label_text, bg="#2e2e2e", fg="white")
-    label.pack(pady=1)
-    dropdown.pack(pady=0)
-    dropdown.config(width=DROPDOWN_WIDTH)
-    
-# === Tournament & Round Info Fields ===
+    label = ctk.CTkLabel(center_container, text=label_text)
+    label.pack(pady=2)
+    dropdown.pack(pady=2)
+    dropdown.configure(width=DROPDOWN_WIDTH)
+
+# Tournament & round entries
 tournament_var = tk.StringVar()
 round_var = tk.StringVar()
+tournament_entry = None
+round_entry = None
 
 text_fields = [
     ("Tournament Name:", tournament_var),
@@ -927,23 +916,19 @@ text_fields = [
 ]
 
 for label_text, var in text_fields:
-    label = tk.Label(center_container, text=label_text, bg="#2e2e2e", fg="white")
-    entry = tk.Entry(center_container, textvariable=var)
-    label.pack(pady=1)
-    entry.pack(pady=0)
-    entry.config(width=ENTRY_WIDTH)
-
-    # Assign to globals for PSD and thumbnail export
+    label = ctk.CTkLabel(center_container, text=label_text)
+    entry = ctk.CTkEntry(center_container, textvariable=var, width=ENTRY_WIDTH)
+    label.pack(pady=2)
+    entry.pack(pady=2)
     if "Tournament" in label_text:
         tournament_entry = entry
     else:
         round_entry = entry
 
-
-# Font/Outline Settings 
+# Font fields
 font_size_var = tk.StringVar(value="50")
 outline_size_var = tk.StringVar(value="1")
-round_font_size_var = tk.StringVar(value="28")  # For smaller round info text
+round_font_size_var = tk.StringVar(value="28")
 
 font_fields = [
     ("Font Size:", font_size_var),
@@ -952,168 +937,131 @@ font_fields = [
 ]
 
 for label_text, var in font_fields:
-    label = tk.Label(center_container, text=label_text, bg="#2e2e2e", fg="white")
-    entry = tk.Entry(center_container, textvariable=var)
-    label.pack(pady=1)
-    entry.pack(pady=0)
-    entry.config(width=ENTRY_WIDTH)
+    label = ctk.CTkLabel(center_container, text=label_text)
+    entry = ctk.CTkEntry(center_container, textvariable=var, width=ENTRY_WIDTH)
+    label.pack(pady=2)
+    entry.pack(pady=2)
+
+# Buttons
+update_button = ctk.CTkButton(center_container, text="Update Preview", command=generate_thumbnail, width=BUTTON_WIDTH)
+update_button.pack(pady=4)
+fullscreen_button = ctk.CTkButton(center_container, text="Preview Fullscreen", command=preview_fullscreen, width=BUTTON_WIDTH)
+fullscreen_button.pack(pady=4)
+save_button = ctk.CTkButton(center_container, text="Save PNG", command=save_thumbnail, width=BUTTON_WIDTH)
+save_button.pack(pady=4)
+psd_button = ctk.CTkButton(center_container, text="Save PSD", command=save_thumbnail_as_psd, width=BUTTON_WIDTH)
+psd_button.pack(pady=4)
 
 
-
-
-# Buttons section
-button_frame = ttk.Frame(center_container, style="TFrame")
-button_frame.pack(pady=0)
-
-# Update Thumbnail (updates within UI)
-update_button = tk.Button(center_container, text="Update Preview", command=generate_thumbnail, bg="#444", fg="white")
-update_button.pack(pady=1)
-update_button.config(width=BUTTON_WIDTH)
-
-# Fullscreen Preview Button
-fullscreen_button = tk.Button(center_container, text="Preview Fullscreen", command=preview_fullscreen, bg="#444", fg="white")
-fullscreen_button.pack(pady=1)
-fullscreen_button.config(width=BUTTON_WIDTH)
-
-# Save Buttons
-save_button = tk.Button(center_container, text="Save PNG", command=save_thumbnail, bg="#444", fg="white")
-save_button.pack(pady=1)
-save_button.config(width=BUTTON_WIDTH)
-
-psd_button = tk.Button(center_container, text="Save PSD", command=save_thumbnail_as_psd, bg="#444", fg="white")
-psd_button.pack(pady=1)
-psd_button.config(width=BUTTON_WIDTH)
-
-# Make sure to maintain the original binding for character_dropdown
-def update_character_selection(event):
-    selected_character = character_dropdown.get()  # Get the selected character
-    character_var.set(selected_character)  # Ensure character_var updates properly
+def update_character_selection(event=None):
+    selected_character = character_dropdown.get()
+    character_var.set(selected_character)
 
 character_dropdown.bind("<<ComboboxSelected>>", update_character_selection)
 opponent_dropdown.bind("<<ComboboxSelected>>", update_character_selection)
 
-#Console Output 
-console_scroll = ttk.Scrollbar(console_frame)
-console_output = tk.Text(
-    console_frame, 
-    wrap="word", 
-    height=20, 
-    width=80, 
-    bg="#1e1e1e", 
-    fg="white",
-    yscrollcommand=console_scroll.set
-)
-console_output.pack(side=tk.LEFT, expand=True, fill="both", padx=10, pady=10)
-console_scroll.pack(side=tk.RIGHT, fill="y")
-console_scroll.config(command=console_output.yview)
+# === Console output tab ===
+console_output = ctk.CTkTextbox(console_frame, width=980, height=480)
+console_output.pack(expand=True, fill="both", padx=10, pady=10)
 
-# Gura PNG Easter Egg Trigger
-def on_gura_click(event):
-    show_epic_tab()
-
+# === Downloader tab controls ===
+image_label = None
 try:
     image_path = resource_path("assets/gawr_gura.png")
     image = Image.open(image_path)
-    image = image.resize((100, 100), Image.Resampling.LANCZOS)
-    photo = ImageTk.PhotoImage(image)
-    image_label = tk.Label(downloader_frame, image=photo, bg="#2e2e2e", cursor="hand2")
-    image_label.image = photo
+
+    # Use CTkImage (fixes the DPI scaling warning)
+    ctk_photo = CTkImage(light_image=image, dark_image=image, size=(100, 100))
+
+    # Create CTkButton with the CTkImage
+    image_label = ctk.CTkButton(
+        downloader_frame,
+        image=ctk_photo,
+        text="",
+        width=120,
+        height=120,
+        fg_color="transparent",
+        hover=False
+    )
     image_label.pack(pady=10)
-    image_label.bind("<Button-1>", on_gura_click)  # 🔥 Click to open hidden tab
+
+    # Handle click (CTkButton still supports bind on underlying widget)
+    def on_gura_click(event=None):
+        show_epic_tab()
+
+    image_label.bind("<Button-1>", on_gura_click)
+
 except Exception as e:
     print("Error loading image:", e)
 
 
-# Button Width
-DOWNLOADER_BUTTON_WIDTH = 30  
+DOWNLOADER_BUTTON_WIDTH = 240
+spreadsheet_status_label_downloader = ctk.CTkLabel(downloader_frame, text="No spreadsheet loaded")
+spreadsheet_status_label_downloader.pack(pady=4)
+select_button = ctk.CTkButton(downloader_frame, text="Select Spreadsheet", command=select_spreadsheet, width=DOWNLOADER_BUTTON_WIDTH)
+select_button.pack(pady=4)
 
-# SpreadSheet Select Label
-spreadsheet_status_label_downloader = tk.Label(downloader_frame, text="No spreadsheet loaded", bg="#2e2e2e", fg="white")
-spreadsheet_status_label_downloader.pack(pady=0)
-select_button = tk.Button(downloader_frame, text="Select Spreadsheet", command=select_spreadsheet, bg="#444", fg="white")
-select_button.config(width=DOWNLOADER_BUTTON_WIDTH)
-select_button.pack(pady=0)
-select_dir_button = tk.Button(downloader_frame, text="Set Download Directory", command=select_directory, bg="#444", fg="white")
-select_dir_button.config(width=DOWNLOADER_BUTTON_WIDTH)
-select_dir_button.pack(pady=0)
+def select_directory():
+    path = filedialog.askdirectory()
+    if path:
+        state.download_directory = path
+        save_config()
 
-# Buttons container frame for download/cancel
-download_buttons_frame = ttk.Frame(downloader_frame, style="TFrame")
-download_buttons_frame.pack(pady=5)
+select_dir_button = ctk.CTkButton(downloader_frame, text="Set Download Directory", command=select_directory, width=DOWNLOADER_BUTTON_WIDTH)
+select_dir_button.pack(pady=4)
 
-download_button = tk.Button(download_buttons_frame, text="Start Download", command=start_download, bg="#444", fg="white")
-download_button.pack(side=tk.LEFT, padx=1)
-download_button.config(width=DOWNLOADER_BUTTON_WIDTH // 2)
+# Download controls frame
+download_buttons_frame = ctk.CTkFrame(downloader_frame)
+download_buttons_frame.pack(pady=6)
 
-# New Cancel button
-cancel_button = tk.Button(download_buttons_frame, text="Cancel Download", command=cancel_download, bg="#444", fg="white", state=tk.DISABLED)
-cancel_button.pack(side=tk.LEFT, padx=1)
-cancel_button.config(width=DOWNLOADER_BUTTON_WIDTH // 2)
+download_button = ctk.CTkButton(download_buttons_frame, text="Start Download", command=start_download, width=DOWNLOADER_BUTTON_WIDTH//2)
+download_button.pack(side="left", padx=4)
 
-progress_bar = ttk.Progressbar(downloader_frame, orient="horizontal", length=300, mode="determinate")
+cancel_button = ctk.CTkButton(download_buttons_frame, text="Cancel Download", command=cancel_download, width=DOWNLOADER_BUTTON_WIDTH//2, state="disabled")
+cancel_button.pack(side="left", padx=4)
+
+# Progress bar now uses pack() to match the parent's pack layout
+progress_bar = ctk.CTkProgressBar(downloader_frame, width=600)
+progress_bar.set(0.0)
+# initially hidden via pack_forget()
 progress_bar.pack_forget()
 
-progress_label = tk.Label(downloader_frame, text="Waiting...", bg="#2e2e2e", fg="white")
-progress_label.pack(pady=5)
+progress_label = ctk.CTkLabel(downloader_frame, text="Waiting...")
+progress_label.pack(pady=6)
 
+# Footer & credits
+footer_frame = ctk.CTkFrame(app)
+footer_frame.pack(side="bottom", fill="x", pady=6)
+credit_label = ctk.CTkLabel(footer_frame, text=f"Made by Ozzy :)\nVersion {VERSION}", font=ctk.CTkFont(size=10))
+credit_label.pack(side="bottom", pady=6)
 
-# Create a frame for the footer that spans across all tabs
-footer_frame = ttk.Frame(root, style="TFrame")
-footer_frame.pack(side="bottom", fill="x", pady=5)
-
-# Secret tab (initially hidden)
-epic_tab = ttk.Frame(notebook, style="TFrame")
+# Secret epic tab (will be added dynamically)
 epic_tab_loaded = False
 
 def show_epic_tab():
     global epic_tab_loaded
-
     if not epic_tab_loaded:
-        notebook.add(epic_tab, text="🌀 Awesome Fucking Tien Edit")
-
-        video_label = Label(epic_tab, bg="#000")
+        tabview.add("🌀 Awesome Fucking Tien Edit")
+        epic_tab = ctk.CTkFrame(tabview.tab("🌀 Awesome Fucking Tien Edit"))
+        epic_tab.pack(expand=True, fill="both", padx=12, pady=12)
+        video_label = ctk.CTkLabel(epic_tab, text="")
         video_label.pack(expand=True, fill="both", padx=10, pady=10)
-
         def play_epic_video():
-            from tkvideo import tkvideo
-            from playsound import playsound
-
             video_path = resource_path("assets/edit.mp4")
             audio_path = resource_path("assets/edit_audio.mp3")
-
-            player = VideoPlayer(video_path, video_label, loop=0, size=(640, 360))
+            player = VideoPlayer(video_path, video_label._label, loop=0, size=(640, 360))
             player.play()
-
-            threading.Thread(target=play_audio, args=(audio_path,), daemon=True).start()
-
-        play_button = tk.Button(epic_tab, text="▶ Play Awesome Edit", command=play_epic_video, bg="#444", fg="white")
+            Thread(target=play_audio, args=(audio_path,), daemon=True).start()
+        play_button = ctk.CTkButton(epic_tab, text="▶ Play Awesome Edit", command=play_epic_video)
         play_button.pack(pady=10)
-
         epic_tab_loaded = True
+    tabview.set("🌀 Awesome Fucking Tien Edit")
 
-    notebook.select(epic_tab)
-
-
-# Credit Label
-credit_label = tk.Label(
-    footer_frame, 
-    text=f"Made by Ozzy :)\nVersion {VERSION}", 
-    font=("Arial", 8), 
-    bg="#2e2e2e", 
-    fg="#7a9fb1"  # Subtle blue-grey color
-)
-credit_label.pack(side="bottom", pady=5)
-
-
-# Enable smooth scrolling with mouse wheel
-def on_mouse_wheel(event):
-    thumbnail_canvas.yview_scroll(-1 * (event.delta // 120), "units")
-
-# Bind mouse wheel scrolling to the canvas
-thumbnail_canvas.bind_all("<MouseWheel>", on_mouse_wheel)  # Windows & MacOS
-
-# Load saved configuration at startup
+# Load saved config & start UI queue
 load_config()
+process_ui_queue_loop()
+flush_logs()
+check_for_updates_at_launch()
 
-
-root.mainloop()
+# Start main loop
+app.mainloop()
