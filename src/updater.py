@@ -5,9 +5,9 @@ import zipfile
 import tempfile
 import shutil
 import subprocess
-from tkinter import messagebox
+from tkinter import messagebox, Tk  # Make sure this is at the top of your file
 
-VERSION = "2.1.0"
+VERSION = "2.1.1"
 VERSION_URL = "https://raw.githubusercontent.com/Ozzmaniac/Yoydownloader/main/version.txt"
 ZIP_URL = "https://github.com/Ozzmaniac/Yoydownloader/releases/latest/download/yoydownloader.zip"
 
@@ -36,7 +36,6 @@ def run_updater():
     subprocess.Popen([temp_updater, "--update", current_exe])
     sys.exit(0)
 
-from tkinter import messagebox, Tk  # Make sure this is at the top of your file
 
 def perform_update(target_exe):
     try:
